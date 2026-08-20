@@ -38,7 +38,7 @@ internal data class ImportedPageSyncProject(
  */
 internal class PageSyncProjectArchive(private val context: Context) {
 
-    fun import(sourceUri: Uri): ImportedPageSyncProject {
+    fun open(sourceUri: Uri): ImportedPageSyncProject {
         val projectRoot = File(
             context.filesDir,
             "page-sync-projects/import-${System.currentTimeMillis()}",
@@ -188,7 +188,9 @@ internal class PageSyncProjectArchive(private val context: Context) {
                 digest.update(buffer, 0, read)
             }
         }
-        return digest.digest().joinToString("") { byte -> "%02x".format(byte) }
+        return digest.digest().joinToString("") { byte ->
+            "%02x".format(byte.toInt() and 0xff)
+        }
     }
 
     private fun safeRelativeFile(root: File, relativePath: String): File {
