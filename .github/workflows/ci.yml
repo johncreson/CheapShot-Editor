@@ -36,6 +36,15 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Install Python gate dependencies
+        shell: bash
+        run: |
+          # verify_otio_exports.py hard-requires OpenTimelineIO and the runner image
+          # does not ship it, so the contract self-tests below fail before Gradle is
+          # ever reached. Pinned because this repo's provenance gates depend on the
+          # verification tooling being reproducible.
+          python -m pip install --disable-pip-version-check "opentimelineio==0.18.1"
+
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 

@@ -173,6 +173,22 @@
                 android:resource="@xml/shortcuts" />
         </activity>
 
+        <!-- Cheap Shot prototype entry point. Kept separate from the full NLE so
+             the narrated-picture-book workflow can be tested without inheriting
+             waveform/timeline complexity. -->
+        <activity
+            android:name=".pagesync.PageSyncActivity"
+            android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|density|uiMode"
+            android:exported="true"
+            android:label="Cheap Shot Page Sync"
+            android:resizeableActivity="true"
+            android:windowSoftInputMode="adjustResize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
         <service
             android:name=".engine.ExportService"
             android:foregroundServiceType="mediaProcessing|dataSync"
