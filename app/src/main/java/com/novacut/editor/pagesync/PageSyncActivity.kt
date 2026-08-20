@@ -16,12 +16,14 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectDragGesturesAfterLongPress
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -30,8 +32,10 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawingPadding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
@@ -49,7 +53,6 @@ import androidx.compose.material.icons.filled.SkipPrevious
 import androidx.compose.material.icons.filled.SwapHoriz
 import androidx.compose.material.icons.filled.VideoFile
 import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
@@ -72,10 +75,14 @@ import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.consume
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
@@ -132,6 +139,8 @@ private fun PageSyncScreen(
     val player = remember { ExoPlayer.Builder(context).build() }
     val exporter = remember(context, ffmpegEngine) { PageSyncExporter(context, ffmpegEngine) }
     val projectArchive = remember(context) { PageSyncProjectArchive(context) }
+    val editList = remember(context) { PageSyncEditList(context) }
+    val timelineState = rememberLazyListState()
 
     var audioUri by remember { mutableStateOf<Uri?>(null) }
     var pages by remember { mutableStateOf<List<Uri>>(emptyList()) }
@@ -143,15 +152,14 @@ private fun PageSyncScreen(
     var syncArmed by remember { mutableStateOf(false) }
     var exporting by remember { mutableStateOf(false) }
     var importing by remember { mutableStateOf(false) }
+    var savingProject by remember { mutableStateOf(false) }
+    var exportingEditList by remember { mutableStateOf(false) }
     var exportProgress by remember { mutableFloatStateOf(0f) }
     var exportMessage by remember { mutableStateOf<String?>(null) }
     var lastExportUri by remember { mutableStateOf<Uri?>(null) }
     var projectName by remember { mutableStateOf<String?>(null) }
     var importedInitialUri by remember { mutableStateOf<Uri?>(null) }
 
-    // Pre-Q the public Movies collection needs WRITE_EXTERNAL_STORAGE
-    // (manifest caps it at maxSdkVersion 28); Q+ uses MediaStore and needs
-    // no permission.
     var hasLegacyStoragePermission by remember {
         mutableStateOf(
             Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q ||
@@ -211,10 +219,33 @@ private fun PageSyncScreen(
                 positionMs = 0L
                 durationMs = project.audioDurationMs
                 syncArmed = false
-                exportMessage = "Imported ${project.pageUris.size} visuals with existing cue timing."
+                exportMessage = if (project.cuePointsMs.size == project.pageUris.size) {
+                    "Imported ${project.pageUris.size} visuals with existing cue timing."
+                } else {
+                    "Imported ${project.pageUris.size} visuals with ${project.cuePointsMs.size} captured cues."
+                }
             }.onFailure { error ->
                 exportMessage = error.message ?: "Could not import this Page Sync project."
             }
+        }
+    }
+
+    fun movePage(from: Int, to: Int) {
+        if (syncArmed || from !in pages.indices || to !in pages.indices || from == to) return
+        val selected = currentPageIndex
+        pages = pages.toMutableList().apply {
+            val moved = removeAt(from)
+            add(to, moved)
+        }
+        currentPageIndex = when {
+            selected == from -> to
+            from < selected && to >= selected -> selected - 1
+            from > selected && to <= selected -> selected + 1
+            else -> selected
+        }.coerceIn(0, pages.lastIndex)
+        exportMessage = "Page moved. Existing timing slots were kept."
+        scope.launch {
+            runCatching { timelineState.animateScrollToItem((to - 1).coerceAtLeast(0)) }
         }
     }
 
@@ -254,6 +285,66 @@ private fun PageSyncScreen(
             persistReadPermission(uri)
             pages = pages.toMutableList().apply { this[currentPageIndex] = uri }
             exportMessage = "Page replaced. Existing timing was kept."
+        }
+    }
+
+    val saveProjectLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument(PAGE_SYNC_PROJECT_MIME),
+    ) { uri ->
+        val audio = audioUri
+        if (uri != null && audio != null && pages.isNotEmpty()) {
+            savingProject = true
+            exportMessage = "Saving Page Sync project…"
+            val destinationName = displayName(context, uri)
+                .substringBeforeLast('.', missingDelimiterValue = "")
+                .ifBlank { projectName ?: "Page Sync Project" }
+            scope.launch {
+                val result = runCatching {
+                    withContext(Dispatchers.IO) {
+                        projectArchive.save(
+                            destinationUri = uri,
+                            projectName = projectName ?: destinationName,
+                            audioUri = audio,
+                            pageUris = pages,
+                            cuePointsMs = cuePoints,
+                            audioDurationMs = durationMs,
+                        )
+                    }
+                }
+                savingProject = false
+                result.onSuccess {
+                    if (projectName.isNullOrBlank()) projectName = destinationName
+                    exportMessage = "Project saved with pages, audio, order, and ${cuePoints.size} cues."
+                }.onFailure { error ->
+                    exportMessage = error.message ?: "Could not save Page Sync project."
+                }
+            }
+        }
+    }
+
+    val editListLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("text/plain"),
+    ) { uri ->
+        if (uri != null && pages.isNotEmpty()) {
+            exportingEditList = true
+            exportMessage = "Writing CMX edit list…"
+            scope.launch {
+                val result = runCatching {
+                    editList.write(
+                        destinationUri = uri,
+                        projectName = projectName ?: "Page Sync Project",
+                        pageUris = pages,
+                        cuePointsMs = cuePoints,
+                        audioDurationMs = durationMs,
+                    )
+                }
+                exportingEditList = false
+                result.onSuccess {
+                    exportMessage = "Edit list saved. It uses 30 fps non-drop timing and clip-name comments for relinking."
+                }.onFailure { error ->
+                    exportMessage = error.message ?: "Could not export edit list."
+                }
+            }
         }
     }
 
@@ -306,6 +397,14 @@ private fun PageSyncScreen(
         }
     }
 
+    LaunchedEffect(currentPageIndex, pages.size) {
+        if (pages.isNotEmpty()) {
+            runCatching {
+                timelineState.animateScrollToItem((currentPageIndex - 1).coerceAtLeast(0))
+            }
+        }
+    }
+
     fun startFreshSync() {
         if (audioUri == null || pages.isEmpty()) return
         cuePoints = listOf(0L)
@@ -320,6 +419,7 @@ private fun PageSyncScreen(
         if (!syncArmed || pages.isEmpty()) return
         if (currentPageIndex >= pages.lastIndex) {
             syncArmed = false
+            player.pause()
             exportMessage = if (cuePoints.size >= pages.size) {
                 "Sync captured. The last page will hold to the end of the soundtrack."
             } else {
@@ -369,7 +469,8 @@ private fun PageSyncScreen(
         syncArmed = true
         val cue = cuePoints.getOrNull(index) ?: 0L
         player.seekTo((cue - 2_000L).coerceAtLeast(0L))
-        exportMessage = "Redo armed from page ${index + 1}. Play, then tap NEXT PAGE at each change."
+        player.play()
+        exportMessage = "Redo armed from page ${index + 1}. Use the right half of the picture for each next page."
     }
 
     fun deleteCurrentPage() {
@@ -384,12 +485,7 @@ private fun PageSyncScreen(
     fun moveCurrentPage(delta: Int) {
         if (currentPageIndex !in pages.indices) return
         val target = (currentPageIndex + delta).coerceIn(0, pages.lastIndex)
-        if (target == currentPageIndex) return
-        pages = pages.toMutableList().apply {
-            val item = removeAt(currentPageIndex)
-            add(target, item)
-        }
-        currentPageIndex = target
+        movePage(currentPageIndex, target)
     }
 
     fun exportVideo() {
@@ -439,151 +535,164 @@ private fun PageSyncScreen(
             .safeDrawingPadding()
             .imePadding(),
         topBar = {
-            Surface(tonalElevation = 3.dp) {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(horizontal = 8.dp, vertical = 6.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    IconButton(onClick = onExit) {
-                        Icon(Icons.Default.ArrowBack, contentDescription = "Back")
-                    }
-                    Column(modifier = Modifier.weight(1f)) {
-                        Text("PAGE SYNC", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
-                        Text(
-                            when {
-                                importing -> "IMPORTING PROJECT"
-                                projectName != null -> projectName.orEmpty()
-                                syncArmed -> "MANUAL CAPTURE"
-                                else -> "REVIEW / FIX"
-                            },
-                            style = MaterialTheme.typography.labelSmall,
-                            color = if (syncArmed) ClearCutAccents.Peach else MaterialTheme.colorScheme.onSurfaceVariant,
-                            maxLines = 1,
-                        )
-                    }
-                    if (exporting) {
-                        CircularProgressIndicator(
-                            progress = { exportProgress.coerceIn(0f, 1f) },
-                            modifier = Modifier.size(28.dp),
-                            strokeWidth = 3.dp,
-                        )
-                    } else if (importing) {
-                        CircularProgressIndicator(
-                            modifier = Modifier.size(28.dp),
-                            strokeWidth = 3.dp,
-                        )
-                    } else {
-                        IconButton(onClick = ::exportVideo, enabled = audioUri != null && pages.isNotEmpty()) {
-                            Icon(Icons.Default.VideoFile, contentDescription = "Export MP4")
+            if (!syncArmed) {
+                Surface(tonalElevation = 3.dp) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 8.dp, vertical = 6.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        IconButton(onClick = onExit) {
+                            Icon(Icons.Default.ArrowBack, contentDescription = "Back")
+                        }
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text("PAGE SYNC", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
+                            Text(
+                                when {
+                                    importing -> "IMPORTING PROJECT"
+                                    savingProject -> "SAVING PROJECT"
+                                    exportingEditList -> "EXPORTING EDIT LIST"
+                                    projectName != null -> projectName.orEmpty()
+                                    else -> "REVIEW / FIX"
+                                },
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                maxLines = 1,
+                            )
+                        }
+                        when {
+                            exporting -> CircularProgressIndicator(
+                                progress = { exportProgress.coerceIn(0f, 1f) },
+                                modifier = Modifier.size(28.dp),
+                                strokeWidth = 3.dp,
+                            )
+                            importing || savingProject || exportingEditList -> CircularProgressIndicator(
+                                modifier = Modifier.size(28.dp),
+                                strokeWidth = 3.dp,
+                            )
+                            else -> IconButton(
+                                onClick = ::exportVideo,
+                                enabled = audioUri != null && pages.isNotEmpty() && cuePoints.size == pages.size,
+                            ) {
+                                Icon(Icons.Default.VideoFile, contentDescription = "Export MP4")
+                            }
                         }
                     }
                 }
             }
         },
     ) { padding ->
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(padding)
-                .padding(horizontal = 12.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            OutlinedButton(
-                onClick = {
-                    projectPicker.launch(
-                        arrayOf(
-                            PAGE_SYNC_PROJECT_MIME,
-                            "application/zip",
-                            "application/octet-stream",
-                        ),
-                    )
+        if (syncArmed && audioUri != null && pages.isNotEmpty()) {
+            SyncPerformanceMode(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(padding),
+                context = context,
+                pages = pages,
+                currentPageIndex = currentPageIndex,
+                positionMs = positionMs,
+                durationMs = durationMs,
+                isPlaying = isPlaying,
+                timelineState = timelineState,
+                onPrevious = ::previousPage,
+                onNext = ::tapNextPage,
+                onTogglePlay = {
+                    if (player.isPlaying) player.pause() else player.play()
                 },
-                modifier = Modifier.fillMaxWidth(),
-                enabled = !importing,
-            ) {
-                Icon(Icons.Default.Add, contentDescription = null)
-                Spacer(Modifier.width(6.dp))
-                Text(if (importing) "Importing project…" else "Import Page Sync project")
-            }
-
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                onReview = {
+                    player.pause()
+                    syncArmed = false
+                    exportMessage = "Sync paused for review. Captured timing was kept."
+                },
+            )
+        } else {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(padding)
+                    .padding(horizontal = 12.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
                 OutlinedButton(
-                    onClick = { audioPicker.launch(arrayOf("audio/*")) },
-                    modifier = Modifier.weight(1f),
+                    onClick = {
+                        projectPicker.launch(
+                            arrayOf(
+                                PAGE_SYNC_PROJECT_MIME,
+                                "application/zip",
+                                "application/octet-stream",
+                            ),
+                        )
+                    },
+                    modifier = Modifier.fillMaxWidth(),
                     enabled = !importing,
                 ) {
-                    Icon(Icons.Default.LibraryMusic, contentDescription = null)
+                    Icon(Icons.Default.Add, contentDescription = null)
                     Spacer(Modifier.width(6.dp))
-                    Text(if (audioUri == null) "Soundtrack" else "Change audio", maxLines = 1)
+                    Text(if (importing) "Importing project…" else "Import Page Sync project")
                 }
-                OutlinedButton(
-                    onClick = { pagesPicker.launch(arrayOf("image/*")) },
-                    modifier = Modifier.weight(1f),
-                    enabled = !importing,
-                ) {
-                    Icon(Icons.Default.Image, contentDescription = null)
-                    Spacer(Modifier.width(6.dp))
-                    Text(if (pages.isEmpty()) "Pages" else "${pages.size} pages", maxLines = 1)
-                }
-            }
 
-            if (audioUri == null || pages.isEmpty()) {
-                EmptyPageSyncCard(hasAudio = audioUri != null, pageCount = pages.size)
-            } else {
                 Row(
                     modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
                 ) {
-                    Text(
-                        "Page ${currentPageIndex + 1} / ${pages.size}",
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.SemiBold,
-                    )
-                    Spacer(Modifier.weight(1f))
-                    Text(
-                        "${formatTime(positionMs)} / ${formatTime(durationMs)}",
-                        style = MaterialTheme.typography.labelLarge,
-                    )
-                }
-
-                Card(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .weight(1f),
-                    colors = CardDefaults.cardColors(containerColor = androidx.compose.ui.graphics.Color.Black),
-                ) {
-                    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                        pages.getOrNull(currentPageIndex)?.let { uri ->
-                            AsyncImage(
-                                model = ImageRequest.Builder(context).data(uri).build(),
-                                contentDescription = "Page ${currentPageIndex + 1}",
-                                modifier = Modifier.fillMaxSize(),
-                                contentScale = ContentScale.Fit,
-                            )
-                        }
+                    OutlinedButton(
+                        onClick = { audioPicker.launch(arrayOf("audio/*")) },
+                        modifier = Modifier.weight(1f),
+                        enabled = !importing,
+                    ) {
+                        Icon(Icons.Default.LibraryMusic, contentDescription = null)
+                        Spacer(Modifier.width(6.dp))
+                        Text(if (audioUri == null) "Soundtrack" else "Change audio", maxLines = 1)
+                    }
+                    OutlinedButton(
+                        onClick = { pagesPicker.launch(arrayOf("image/*")) },
+                        modifier = Modifier.weight(1f),
+                        enabled = !importing,
+                    ) {
+                        Icon(Icons.Default.Image, contentDescription = null)
+                        Spacer(Modifier.width(6.dp))
+                        Text(if (pages.isEmpty()) "Pages" else "${pages.size} pages", maxLines = 1)
                     }
                 }
 
-                if (syncArmed) {
-                    Button(
-                        onClick = ::tapNextPage,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(72.dp),
-                        colors = ButtonDefaults.buttonColors(containerColor = ClearCutAccents.Sky),
+                if (audioUri == null || pages.isEmpty()) {
+                    EmptyPageSyncCard(hasAudio = audioUri != null, pageCount = pages.size)
+                } else {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
                     ) {
                         Text(
-                            if (currentPageIndex < pages.lastIndex) "NEXT PAGE  ▶" else "FINISH SYNC",
-                            style = MaterialTheme.typography.headlineSmall,
-                            fontWeight = FontWeight.Bold,
+                            "Page ${currentPageIndex + 1} / ${pages.size}",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                        Spacer(Modifier.weight(1f))
+                        Text(
+                            "${formatTime(positionMs)} / ${formatTime(durationMs)}",
+                            style = MaterialTheme.typography.labelLarge,
                         )
                     }
-                } else {
+
+                    Card(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .weight(1f),
+                        colors = CardDefaults.cardColors(containerColor = Color.Black),
+                    ) {
+                        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                            pages.getOrNull(currentPageIndex)?.let { uri ->
+                                AsyncImage(
+                                    model = ImageRequest.Builder(context).data(uri).build(),
+                                    contentDescription = "Page ${currentPageIndex + 1}",
+                                    modifier = Modifier.fillMaxSize(),
+                                    contentScale = ContentScale.Fit,
+                                )
+                            }
+                        }
+                    }
+
                     Button(
                         onClick = ::startFreshSync,
                         modifier = Modifier.fillMaxWidth(),
@@ -592,130 +701,288 @@ private fun PageSyncScreen(
                         Spacer(Modifier.width(6.dp))
                         Text(if (cuePoints.size == pages.size) "SYNC AGAIN FROM START" else "START MANUAL SYNC")
                     }
-                }
 
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceEvenly,
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    ControlButton(Icons.Default.SkipPrevious, "Previous page", ::previousPage)
-                    ControlButton(Icons.Default.FastRewind, "Back 3 seconds", ::seekBackThreeSeconds)
-                    ControlButton(
-                        if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
-                        if (isPlaying) "Pause" else "Play",
-                    ) {
-                        if (player.isPlaying) player.pause() else player.play()
-                    }
-                    ControlButton(Icons.Default.Refresh, "Redo from here", ::redoFromHere)
-                }
-
-                if (currentPageIndex > 0 && currentPageIndex < cuePoints.size) {
                     Row(
                         modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.Center,
+                        horizontalArrangement = Arrangement.SpaceEvenly,
                         verticalAlignment = Alignment.CenterVertically,
                     ) {
-                        TextButton(onClick = { nudgeCurrentCue(-500L) }) { Text("−0.5s") }
-                        TextButton(onClick = { nudgeCurrentCue(-100L) }) { Text("−0.1s") }
-                        Surface(shape = RoundedCornerShape(8.dp), tonalElevation = 2.dp) {
-                            Text(
-                                "Cue ${formatTime(cuePoints[currentPageIndex])}",
-                                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
-                                style = MaterialTheme.typography.labelLarge,
+                        ControlButton(Icons.Default.SkipPrevious, "Previous page", ::previousPage)
+                        ControlButton(Icons.Default.FastRewind, "Back 3 seconds", ::seekBackThreeSeconds)
+                        ControlButton(
+                            if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
+                            if (isPlaying) "Pause" else "Play",
+                        ) {
+                            if (player.isPlaying) player.pause() else player.play()
+                        }
+                        ControlButton(Icons.Default.Refresh, "Redo from here", ::redoFromHere)
+                    }
+
+                    if (currentPageIndex > 0 && currentPageIndex < cuePoints.size) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.Center,
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            TextButton(onClick = { nudgeCurrentCue(-500L) }) { Text("−0.5s") }
+                            TextButton(onClick = { nudgeCurrentCue(-100L) }) { Text("−0.1s") }
+                            Surface(shape = RoundedCornerShape(8.dp), tonalElevation = 2.dp) {
+                                Text(
+                                    "Cue ${formatTime(cuePoints[currentPageIndex])}",
+                                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                                    style = MaterialTheme.typography.labelLarge,
+                                )
+                            }
+                            TextButton(onClick = { nudgeCurrentCue(100L) }) { Text("+0.1s") }
+                            TextButton(onClick = { nudgeCurrentCue(500L) }) { Text("+0.5s") }
+                        }
+                    }
+
+                    HorizontalDivider()
+
+                    Text(
+                        "Tap to jump • Hold and drag to reorder",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    LazyRow(
+                        state = timelineState,
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    ) {
+                        itemsIndexed(pages, key = { _, uri -> uri.toString() }) { index, uri ->
+                            PageThumbnail(
+                                uri = uri,
+                                pageNumber = index + 1,
+                                selected = index == currentPageIndex,
+                                reorderEnabled = true,
+                                onClick = {
+                                    currentPageIndex = index
+                                    cuePoints.getOrNull(index)?.let(player::seekTo)
+                                },
+                                onMoveBy = { delta ->
+                                    val from = pages.indexOf(uri)
+                                    if (from >= 0) {
+                                        val target = (from + delta).coerceIn(0, pages.lastIndex)
+                                        movePage(from, target)
+                                    }
+                                },
                             )
                         }
-                        TextButton(onClick = { nudgeCurrentCue(100L) }) { Text("+0.1s") }
-                        TextButton(onClick = { nudgeCurrentCue(500L) }) { Text("+0.5s") }
+                    }
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(4.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        TextButton(onClick = { insertPicker.launch(arrayOf("image/*")) }) {
+                            Icon(Icons.Default.Add, contentDescription = null)
+                            Text("Insert")
+                        }
+                        TextButton(onClick = { replacePicker.launch(arrayOf("image/*")) }) {
+                            Icon(Icons.Default.SwapHoriz, contentDescription = null)
+                            Text("Replace")
+                        }
+                        IconButton(onClick = { moveCurrentPage(-1) }, enabled = currentPageIndex > 0) {
+                            Icon(Icons.Default.ArrowBack, contentDescription = "Move page left")
+                        }
+                        IconButton(onClick = { moveCurrentPage(1) }, enabled = currentPageIndex < pages.lastIndex) {
+                            Icon(Icons.Default.ArrowForward, contentDescription = "Move page right")
+                        }
+                        Spacer(Modifier.weight(1f))
+                        IconButton(onClick = ::deleteCurrentPage, enabled = pages.isNotEmpty()) {
+                            Icon(Icons.Default.Delete, contentDescription = "Delete page")
+                        }
+                    }
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        OutlinedButton(
+                            onClick = {
+                                saveProjectLauncher.launch(
+                                    "${safeFileStem(projectName ?: "Page Sync Project")}.cheapshot-pagesync",
+                                )
+                            },
+                            modifier = Modifier.weight(1f),
+                            enabled = !savingProject,
+                        ) {
+                            Icon(Icons.Default.Save, contentDescription = null)
+                            Spacer(Modifier.width(4.dp))
+                            Text("Save project", maxLines = 1)
+                        }
+                        OutlinedButton(
+                            onClick = {
+                                editListLauncher.launch(
+                                    "${safeFileStem(projectName ?: "Page Sync Project")}.edl",
+                                )
+                            },
+                            modifier = Modifier.weight(1f),
+                            enabled = cuePoints.size == pages.size && !exportingEditList,
+                        ) {
+                            Text("Export EDL", maxLines = 1)
+                        }
+                    }
+
+                    exportMessage?.let { message ->
+                        Text(
+                            message,
+                            modifier = Modifier.fillMaxWidth(),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+
+                    if (!exporting && !importing && cuePoints.size == pages.size) {
+                        Button(onClick = ::exportVideo, modifier = Modifier.fillMaxWidth()) {
+                            Icon(Icons.Default.VideoFile, contentDescription = null)
+                            Spacer(Modifier.width(6.dp))
+                            Text("EXPORT VERTICAL MP4")
+                        }
+                    }
+
+                    lastExportUri?.let { uri ->
+                        OutlinedButton(
+                            onClick = {
+                                runCatching {
+                                    context.startActivity(
+                                        Intent(Intent.ACTION_VIEW)
+                                            .setDataAndType(uri, "video/mp4")
+                                            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION),
+                                    )
+                                }
+                            },
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Icon(Icons.Default.VideoFile, contentDescription = null)
+                            Spacer(Modifier.width(6.dp))
+                            Text("WATCH EXPORTED VIDEO")
+                        }
                     }
                 }
+            }
+        }
+    }
+}
 
-                HorizontalDivider()
+@Composable
+private fun SyncPerformanceMode(
+    modifier: Modifier,
+    context: Context,
+    pages: List<Uri>,
+    currentPageIndex: Int,
+    positionMs: Long,
+    durationMs: Long,
+    isPlaying: Boolean,
+    timelineState: LazyListState,
+    onPrevious: () -> Unit,
+    onNext: () -> Unit,
+    onTogglePlay: () -> Unit,
+    onReview: () -> Unit,
+) {
+    Column(
+        modifier = modifier.padding(horizontal = 6.dp, vertical = 4.dp),
+        verticalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                "${currentPageIndex + 1} / ${pages.size}",
+                style = MaterialTheme.typography.labelLarge,
+                fontWeight = FontWeight.Bold,
+            )
+            Spacer(Modifier.weight(1f))
+            Text(
+                "${formatTime(positionMs)} / ${formatTime(durationMs)}",
+                style = MaterialTheme.typography.labelMedium,
+            )
+            IconButton(onClick = onTogglePlay, modifier = Modifier.size(40.dp)) {
+                Icon(
+                    if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
+                    contentDescription = if (isPlaying) "Pause" else "Play",
+                )
+            }
+            TextButton(onClick = onReview) { Text("REVIEW") }
+        }
 
-                LazyRow(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(6.dp),
-                ) {
-                    itemsIndexed(pages, key = { index, uri -> "$index:$uri" }) { index, uri ->
-                        PageThumbnail(
-                            uri = uri,
-                            pageNumber = index + 1,
-                            selected = index == currentPageIndex,
-                            onClick = {
-                                // While a sync is armed, jumping past the
-                                // captured range would file the next tap's cue
-                                // against the wrong page — clamp instead.
-                                currentPageIndex = if (syncArmed) {
-                                    index.coerceAtMost((cuePoints.size - 1).coerceAtLeast(0))
-                                } else {
-                                    index
-                                }
-                                cuePoints.getOrNull(currentPageIndex)?.let(player::seekTo)
-                            },
+        Card(
+            modifier = Modifier
+                .fillMaxWidth()
+                .weight(1f),
+            colors = CardDefaults.cardColors(containerColor = Color.Black),
+        ) {
+            Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                pages.getOrNull(currentPageIndex)?.let { uri ->
+                    AsyncImage(
+                        model = ImageRequest.Builder(context).data(uri).build(),
+                        contentDescription = "Page ${currentPageIndex + 1}",
+                        modifier = Modifier.fillMaxSize(),
+                        contentScale = ContentScale.Fit,
+                    )
+                }
+                Row(modifier = Modifier.fillMaxSize()) {
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .fillMaxHeight()
+                            .clickable(onClick = onPrevious),
+                        contentAlignment = Alignment.CenterStart,
+                    ) {
+                        Icon(
+                            Icons.Default.ArrowBack,
+                            contentDescription = "Previous page",
+                            tint = Color.White.copy(alpha = if (currentPageIndex > 0) 0.55f else 0.18f),
+                            modifier = Modifier
+                                .padding(10.dp)
+                                .size(36.dp),
+                        )
+                    }
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .fillMaxHeight()
+                            .clickable(onClick = onNext),
+                        contentAlignment = Alignment.CenterEnd,
+                    ) {
+                        Icon(
+                            Icons.Default.ArrowForward,
+                            contentDescription = if (currentPageIndex < pages.lastIndex) "Next page" else "Finish sync",
+                            tint = Color.White.copy(alpha = 0.65f),
+                            modifier = Modifier
+                                .padding(10.dp)
+                                .size(36.dp),
                         )
                     }
                 }
+            }
+        }
 
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(4.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    TextButton(onClick = { insertPicker.launch(arrayOf("image/*")) }) {
-                        Icon(Icons.Default.Add, contentDescription = null)
-                        Text("Insert")
-                    }
-                    TextButton(onClick = { replacePicker.launch(arrayOf("image/*")) }) {
-                        Icon(Icons.Default.SwapHoriz, contentDescription = null)
-                        Text("Replace")
-                    }
-                    IconButton(onClick = { moveCurrentPage(-1) }, enabled = currentPageIndex > 0) {
-                        Icon(Icons.Default.ArrowBack, contentDescription = "Move page left")
-                    }
-                    IconButton(onClick = { moveCurrentPage(1) }, enabled = currentPageIndex < pages.lastIndex) {
-                        Icon(Icons.Default.ArrowForward, contentDescription = "Move page right")
-                    }
-                    Spacer(Modifier.weight(1f))
-                    IconButton(onClick = ::deleteCurrentPage, enabled = pages.isNotEmpty()) {
-                        Icon(Icons.Default.Delete, contentDescription = "Delete page")
-                    }
-                }
+        Text(
+            if (currentPageIndex < pages.lastIndex) "LEFT = previous   •   RIGHT = capture next page" else "RIGHT = finish sync",
+            modifier = Modifier.align(Alignment.CenterHorizontally),
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
 
-                exportMessage?.let { message ->
-                    Text(
-                        message,
-                        modifier = Modifier.fillMaxWidth(),
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    )
-                }
-
-                if (!exporting && !importing && cuePoints.size == pages.size) {
-                    Button(onClick = ::exportVideo, modifier = Modifier.fillMaxWidth()) {
-                        Icon(Icons.Default.Save, contentDescription = null)
-                        Spacer(Modifier.width(6.dp))
-                        Text("EXPORT VERTICAL MP4")
-                    }
-                }
-
-                lastExportUri?.let { uri ->
-                    OutlinedButton(
-                        onClick = {
-                            runCatching {
-                                context.startActivity(
-                                    Intent(Intent.ACTION_VIEW)
-                                        .setDataAndType(uri, "video/mp4")
-                                        .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION),
-                                )
-                            }
-                        },
-                        modifier = Modifier.fillMaxWidth(),
-                    ) {
-                        Icon(Icons.Default.VideoFile, contentDescription = null)
-                        Spacer(Modifier.width(6.dp))
-                        Text("WATCH EXPORTED VIDEO")
-                    }
-                }
+        LazyRow(
+            state = timelineState,
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            itemsIndexed(pages, key = { _, uri -> uri.toString() }) { index, uri ->
+                PageThumbnail(
+                    uri = uri,
+                    pageNumber = index + 1,
+                    selected = index == currentPageIndex,
+                    compact = true,
+                    reorderEnabled = false,
+                    onClick = {},
+                    onMoveBy = {},
+                )
             }
         }
     }
@@ -761,16 +1028,56 @@ private fun PageThumbnail(
     pageNumber: Int,
     selected: Boolean,
     onClick: () -> Unit,
+    onMoveBy: (Int) -> Unit,
+    reorderEnabled: Boolean,
+    compact: Boolean = false,
 ) {
     val context = LocalContext.current
+    var dragging by remember { mutableStateOf(false) }
+    val moveHandler by rememberUpdatedState(onMoveBy)
+    val width = if (compact) 50.dp else 66.dp
+
     Column(
         modifier = Modifier
-            .width(66.dp)
+            .width(width)
             .clip(RoundedCornerShape(8.dp))
             .then(
-                if (selected) Modifier.border(2.dp, ClearCutAccents.Sky, RoundedCornerShape(8.dp))
-                else Modifier,
+                when {
+                    dragging -> Modifier.border(2.dp, ClearCutAccents.Peach, RoundedCornerShape(8.dp))
+                    selected -> Modifier.border(2.dp, ClearCutAccents.Sky, RoundedCornerShape(8.dp))
+                    else -> Modifier
+                },
             )
+            .pointerInput(reorderEnabled) {
+                if (!reorderEnabled) return@pointerInput
+                var accumulatedX = 0f
+                val threshold = 34.dp.toPx()
+                detectDragGesturesAfterLongPress(
+                    onDragStart = {
+                        dragging = true
+                        accumulatedX = 0f
+                    },
+                    onDragCancel = {
+                        dragging = false
+                        accumulatedX = 0f
+                    },
+                    onDragEnd = {
+                        dragging = false
+                        accumulatedX = 0f
+                    },
+                    onDrag = { change, dragAmount ->
+                        change.consume()
+                        accumulatedX += dragAmount.x
+                        if (accumulatedX >= threshold) {
+                            moveHandler(1)
+                            accumulatedX -= threshold
+                        } else if (accumulatedX <= -threshold) {
+                            moveHandler(-1)
+                            accumulatedX += threshold
+                        }
+                    },
+                )
+            }
             .clickable(onClick = onClick)
             .padding(3.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
@@ -782,7 +1089,7 @@ private fun PageThumbnail(
                 .fillMaxWidth()
                 .aspectRatio(9f / 16f)
                 .clip(RoundedCornerShape(5.dp))
-                .background(androidx.compose.ui.graphics.Color.Black),
+                .background(Color.Black),
             contentScale = ContentScale.Crop,
         )
         Text("$pageNumber", style = MaterialTheme.typography.labelSmall)
@@ -806,6 +1113,14 @@ private fun displayName(context: Context, uri: Uri): String {
             if (cursor.moveToFirst()) cursor.getString(0) else null
         }
     }.getOrNull() ?: uri.lastPathSegment.orEmpty()
+}
+
+private fun safeFileStem(name: String): String {
+    return name
+        .replace(Regex("[^A-Za-z0-9._ -]+"), "_")
+        .trim(' ', '.', '_')
+        .take(96)
+        .ifBlank { "Page_Sync_Project" }
 }
 
 private fun formatTime(ms: Long): String {
