@@ -1,0 +1,32 @@
+name: Page Sync import fix
+
+on:
+  push:
+    branches:
+      - feature/pagesync-project-import
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feature/pagesync-project-import
+      - name: Remove obsolete Compose consume import
+        shell: bash
+        run: |
+          FILE=app/src/main/java/com/novacut/editor/pagesync/PageSyncActivity.kt
+          sed -i '/^import androidx\.compose\.ui\.input\.pointer\.consume$/d' "$FILE"
+          if git diff --quiet; then
+            echo "No patch required"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$FILE"
+          git commit -m "Fix Compose pointer consume import"
+          git push origin HEAD:feature/pagesync-project-import
