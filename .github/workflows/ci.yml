@@ -48,11 +48,19 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Install Android API and build tools
+      - name: Install Android build tools and accept licenses
         shell: bash
         run: |
+          # 'platforms;android-37' is not listed in any repository XML the
+          # reachable sdkmanagers can read — the runner image's tools speak
+          # SDK XML v3, and even a downloaded-current commandlinetools build
+          # could not see the package. Do NOT install the platform here:
+          # accept the licenses and install the old-enough packages, then let
+          # AGP's SDK auto-download fetch android-37 during the Gradle build.
+          # AGP bundles a repository parser as new as AGP itself, which is
+          # exactly the component that can resolve the newest platform.
           yes | sdkmanager --licenses >/dev/null || true
-          sdkmanager "platforms;android-37" "build-tools;35.0.0" "platform-tools"
+          sdkmanager "build-tools;35.0.0" "platform-tools"
 
       - name: Configure Gradle
         uses: gradle/actions/setup-gradle@v4
