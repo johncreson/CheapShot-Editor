@@ -92,36 +92,6 @@ jobs:
           python scripts/validate_android_audio_api_policy.py
           python scripts/verify_native_supply_chain.py
 
-      # TEMPORARY (remove before merge): the verification metadata was
-      # generated on Windows, so Linux-classifier tool jars (aapt2 et al.)
-      # were never recorded, and several artifacts live behind hosts this
-      # session cannot reach to compute checksums. Let Gradle itself record
-      # every checksum the real build resolves, and print the diff so the
-      # additions can be committed; the real gated step below then runs
-      # against the freshly written file as an end-to-end preview.
-      - name: TEMPORARY capture missing verification checksums
-        shell: bash
-        run: |
-          chmod +x ./gradlew
-          set +e
-          ./gradlew --write-verification-metadata sha256 \
-            :app:testQaUnitTest \
-            :app:lintDebug \
-            :app:assembleQa \
-            :app:assembleQaAndroidTest \
-            :app:assembleDebug \
-            :app:generateNativeSbom \
-            :app:verifyResolvedAdvisoryFloors \
-            --no-daemon \
-            --stacktrace \
-            --console=plain
-          RC=$?
-          set -e
-          echo "=====VERIFICATION-METADATA-DIFF-BEGIN====="
-          git diff --unified=0 -- gradle/verification-metadata.xml || true
-          echo "=====VERIFICATION-METADATA-DIFF-END====="
-          exit $RC
-
       - name: Run JVM, lint, QA, and debug build gates
         shell: bash
         run: |
