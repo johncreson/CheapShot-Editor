@@ -50,10 +50,10 @@ jobs:
           find app/build/outputs/apk/debug -type f -name '*.apk' -print0 \
             | xargs -0 -r -n 1 python scripts/check_16kb_alignment.py
 
-      - name: Upload installable APK only
+      - name: Upload ARM64 installable APK only
         uses: actions/upload-artifact@v4
         with:
-          name: CheapShot-PageSync-APK
+          name: CheapShot-PageSync-ARM64-APK
           if-no-files-found: error
           compression-level: 0
-          path: app/build/outputs/apk/debug/*.apk
+          path: app/build/outputs/apk/debug/*arm64-v8a*.apk
