@@ -197,7 +197,7 @@ private fun PageSyncScreen(
         lastExportUri = null
         scope.launch {
             val imported = runCatching {
-                withContext(Dispatchers.IO) { projectArchive.import(uri) }
+                withContext(Dispatchers.IO) { projectArchive.open(uri) }
             }
             importing = false
             imported.onSuccess { project ->
@@ -463,13 +463,14 @@ private fun PageSyncScreen(
                             maxLines = 1,
                         )
                     }
-                    if (exporting || importing) {
+                    if (exporting) {
                         CircularProgressIndicator(
-                            progress = if (exporting) {
-                                { exportProgress.coerceIn(0f, 1f) }
-                            } else {
-                                { 0f }
-                            },
+                            progress = { exportProgress.coerceIn(0f, 1f) },
+                            modifier = Modifier.size(28.dp),
+                            strokeWidth = 3.dp,
+                        )
+                    } else if (importing) {
+                        CircularProgressIndicator(
                             modifier = Modifier.size(28.dp),
                             strokeWidth = 3.dp,
                         )
