@@ -1,0 +1,59 @@
+name: Cheap Shot Page Sync V2 APK
+
+on:
+  push:
+    branches:
+      - release/pagesync-v2-apk
+  pull_request:
+    branches:
+      - master
+
+permissions:
+  contents: read
+
+jobs:
+  build-apk:
+    name: Build installable Page Sync V2 APK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Accept Android licenses
+        shell: bash
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "build-tools;35.0.0" "platform-tools"
+
+      - name: Configure Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build debug APK
+        shell: bash
+        run: |
+          chmod +x ./gradlew
+          ./gradlew :app:assembleDebug --no-daemon --stacktrace --console=plain
+
+      - name: Verify APK alignment
+        shell: bash
+        run: |
+          find app/build/outputs/apk/debug -type f -name '*.apk' -print0 \
+            | xargs -0 -r -n 1 python scripts/check_16kb_alignment.py
+
+      - name: Upload ARM64 installable APK only
+        uses: actions/upload-artifact@v4
+        with:
+          name: CheapShot-PageSync-V2-ARM64-APK
+          if-no-files-found: error
+          compression-level: 0
+          path: app/build/outputs/apk/debug/*arm64-v8a*.apk
