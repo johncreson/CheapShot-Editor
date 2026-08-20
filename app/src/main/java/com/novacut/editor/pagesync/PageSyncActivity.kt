@@ -1,8 +1,11 @@
 package com.novacut.editor.pagesync
 
+import android.Manifest
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.provider.OpenableColumns
 import androidx.activity.ComponentActivity
@@ -77,6 +80,7 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
@@ -134,6 +138,28 @@ private fun PageSyncScreen(
     var exportProgress by remember { mutableFloatStateOf(0f) }
     var exportMessage by remember { mutableStateOf<String?>(null) }
     var lastExportUri by remember { mutableStateOf<Uri?>(null) }
+
+    // Pre-Q the public Movies collection needs WRITE_EXTERNAL_STORAGE
+    // (manifest caps it at maxSdkVersion 28); Q+ uses MediaStore and needs
+    // no permission.
+    var hasLegacyStoragePermission by remember {
+        mutableStateOf(
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q ||
+                ContextCompat.checkSelfPermission(
+                    context, Manifest.permission.WRITE_EXTERNAL_STORAGE,
+                ) == PackageManager.PERMISSION_GRANTED
+        )
+    }
+    val legacyStoragePermission = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        hasLegacyStoragePermission = granted
+        exportMessage = if (granted) {
+            "Storage permission granted — tap Export again."
+        } else {
+            "Storage permission is required to save to Movies/CheapShot."
+        }
+    }
 
     fun resetTiming() {
         cuePoints = if (pages.isEmpty()) emptyList() else listOf(0L)
@@ -242,7 +268,11 @@ private fun PageSyncScreen(
         if (!syncArmed || pages.isEmpty()) return
         if (currentPageIndex >= pages.lastIndex) {
             syncArmed = false
-            exportMessage = "Sync captured. The last page will hold to the end of the soundtrack."
+            exportMessage = if (cuePoints.size >= pages.size) {
+                "Sync captured. The last page will hold to the end of the soundtrack."
+            } else {
+                "Sync stopped with pages missing cues — redo from the unfinished page."
+            }
             return
         }
         cuePoints = PageSyncTimeline.captureNextCue(
@@ -319,6 +349,10 @@ private fun PageSyncScreen(
         }
         if (durationMs <= 0L) {
             exportMessage = "The soundtrack duration is not available yet."
+            return
+        }
+        if (!hasLegacyStoragePermission) {
+            legacyStoragePermission.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
             return
         }
         exporting = true
@@ -525,8 +559,15 @@ private fun PageSyncScreen(
                             pageNumber = index + 1,
                             selected = index == currentPageIndex,
                             onClick = {
-                                currentPageIndex = index
-                                cuePoints.getOrNull(index)?.let(player::seekTo)
+                                // While a sync is armed, jumping past the
+                                // captured range would file the next tap's cue
+                                // against the wrong page — clamp instead.
+                                currentPageIndex = if (syncArmed) {
+                                    index.coerceAtMost((cuePoints.size - 1).coerceAtLeast(0))
+                                } else {
+                                    index
+                                }
+                                cuePoints.getOrNull(currentPageIndex)?.let(player::seekTo)
                             },
                         )
                     }

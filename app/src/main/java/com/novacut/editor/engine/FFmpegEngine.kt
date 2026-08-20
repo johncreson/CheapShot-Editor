@@ -132,9 +132,10 @@ class FFmpegEngine @Inject constructor(
      */
     suspend fun execute(
         command: String,
+        progressDurationMs: Long? = null,
         onProgress: (Float) -> Unit = {}
     ): Int = withContext(Dispatchers.IO) {
-        executeCommand(command, onProgress = onProgress)
+        executeCommand(command, progressDurationMs = progressDurationMs, onProgress = onProgress)
     }
 
     /**

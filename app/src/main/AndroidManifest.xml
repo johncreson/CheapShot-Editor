@@ -12,6 +12,11 @@
         android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC"
         android:maxSdkVersion="34" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Pre-Q only: lets Page Sync publish exports into the public Movies
+         collection instead of the app-private external dir. -->
+    <uses-permission
+        android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="28" />
     <uses-permission android:name="android.permission.VIBRATE" />
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
@@ -176,12 +181,16 @@
         <!-- Cheap Shot prototype entry point. Kept separate from the full NLE so
              the narrated-picture-book workflow can be tested without inheriting
              waveform/timeline complexity. -->
+        <!-- Distinct taskAffinity: without it this second LAUNCHER activity
+             affinity-matches the main editor task, and tapping the Page Sync
+             icon while ClearCut is warm just resurfaces the editor. -->
         <activity
             android:name=".pagesync.PageSyncActivity"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden|density|uiMode"
             android:exported="true"
             android:label="Cheap Shot Page Sync"
             android:resizeableActivity="true"
+            android:taskAffinity="com.novacut.editor.pagesync"
             android:windowSoftInputMode="adjustResize">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
