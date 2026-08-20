@@ -95,6 +95,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import javax.inject.Inject
 import kotlin.math.max
 
@@ -105,10 +106,14 @@ class PageSyncActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        val initialProjectUri = intent
+            .takeIf { it.action == Intent.ACTION_VIEW }
+            ?.data
         setContent {
             ClearCutTheme {
                 PageSyncScreen(
                     ffmpegEngine = ffmpegEngine,
+                    initialProjectUri = initialProjectUri,
                     onExit = { finish() },
                 )
             }
@@ -119,12 +124,14 @@ class PageSyncActivity : ComponentActivity() {
 @Composable
 private fun PageSyncScreen(
     ffmpegEngine: FFmpegEngine,
+    initialProjectUri: Uri? = null,
     onExit: () -> Unit,
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val player = remember { ExoPlayer.Builder(context).build() }
     val exporter = remember(context, ffmpegEngine) { PageSyncExporter(context, ffmpegEngine) }
+    val projectArchive = remember(context) { PageSyncProjectArchive(context) }
 
     var audioUri by remember { mutableStateOf<Uri?>(null) }
     var pages by remember { mutableStateOf<List<Uri>>(emptyList()) }
@@ -135,9 +142,12 @@ private fun PageSyncScreen(
     var isPlaying by remember { mutableStateOf(false) }
     var syncArmed by remember { mutableStateOf(false) }
     var exporting by remember { mutableStateOf(false) }
+    var importing by remember { mutableStateOf(false) }
     var exportProgress by remember { mutableFloatStateOf(0f) }
     var exportMessage by remember { mutableStateOf<String?>(null) }
     var lastExportUri by remember { mutableStateOf<Uri?>(null) }
+    var projectName by remember { mutableStateOf<String?>(null) }
+    var importedInitialUri by remember { mutableStateOf<Uri?>(null) }
 
     // Pre-Q the public Movies collection needs WRITE_EXTERNAL_STORAGE
     // (manifest caps it at maxSdkVersion 28); Q+ uses MediaStore and needs
@@ -179,9 +189,42 @@ private fun PageSyncScreen(
         }
     }
 
+    fun importProject(uri: Uri) {
+        if (importing) return
+        persistReadPermission(uri)
+        importing = true
+        exportMessage = "Importing Page Sync project…"
+        lastExportUri = null
+        scope.launch {
+            val imported = runCatching {
+                withContext(Dispatchers.IO) { projectArchive.import(uri) }
+            }
+            importing = false
+            imported.onSuccess { project ->
+                player.pause()
+                player.seekTo(0L)
+                projectName = project.name
+                audioUri = project.audioUri
+                pages = project.pageUris
+                cuePoints = project.cuePointsMs
+                currentPageIndex = 0
+                positionMs = 0L
+                durationMs = project.audioDurationMs
+                syncArmed = false
+                exportMessage = "Imported ${project.pageUris.size} visuals with existing cue timing."
+            }.onFailure { error ->
+                exportMessage = error.message ?: "Could not import this Page Sync project."
+            }
+        }
+    }
+
+    val projectPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) importProject(uri)
+    }
     val audioPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         if (uri != null) {
             persistReadPermission(uri)
+            projectName = null
             audioUri = uri
             resetTiming()
         }
@@ -189,6 +232,7 @@ private fun PageSyncScreen(
     val pagesPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
         if (uris.isNotEmpty()) {
             uris.forEach(::persistReadPermission)
+            projectName = null
             pages = uris.sortedWith(pageUriComparator(context))
             cuePoints = listOf(0L)
             currentPageIndex = 0
@@ -210,6 +254,14 @@ private fun PageSyncScreen(
             persistReadPermission(uri)
             pages = pages.toMutableList().apply { this[currentPageIndex] = uri }
             exportMessage = "Page replaced. Existing timing was kept."
+        }
+    }
+
+    LaunchedEffect(initialProjectUri) {
+        val uri = initialProjectUri ?: return@LaunchedEffect
+        if (importedInitialUri != uri) {
+            importedInitialUri = uri
+            importProject(uri)
         }
     }
 
@@ -400,14 +452,24 @@ private fun PageSyncScreen(
                     Column(modifier = Modifier.weight(1f)) {
                         Text("PAGE SYNC", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
                         Text(
-                            if (syncArmed) "MANUAL CAPTURE" else "REVIEW / FIX",
+                            when {
+                                importing -> "IMPORTING PROJECT"
+                                projectName != null -> projectName.orEmpty()
+                                syncArmed -> "MANUAL CAPTURE"
+                                else -> "REVIEW / FIX"
+                            },
                             style = MaterialTheme.typography.labelSmall,
                             color = if (syncArmed) ClearCutAccents.Peach else MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
                         )
                     }
-                    if (exporting) {
+                    if (exporting || importing) {
                         CircularProgressIndicator(
-                            progress = { exportProgress.coerceIn(0f, 1f) },
+                            progress = if (exporting) {
+                                { exportProgress.coerceIn(0f, 1f) }
+                            } else {
+                                { 0f }
+                            },
                             modifier = Modifier.size(28.dp),
                             strokeWidth = 3.dp,
                         )
@@ -427,6 +489,24 @@ private fun PageSyncScreen(
                 .padding(horizontal = 12.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
+            OutlinedButton(
+                onClick = {
+                    projectPicker.launch(
+                        arrayOf(
+                            PAGE_SYNC_PROJECT_MIME,
+                            "application/zip",
+                            "application/octet-stream",
+                        ),
+                    )
+                },
+                modifier = Modifier.fillMaxWidth(),
+                enabled = !importing,
+            ) {
+                Icon(Icons.Default.Add, contentDescription = null)
+                Spacer(Modifier.width(6.dp))
+                Text(if (importing) "Importing project…" else "Import Page Sync project")
+            }
+
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
@@ -434,6 +514,7 @@ private fun PageSyncScreen(
                 OutlinedButton(
                     onClick = { audioPicker.launch(arrayOf("audio/*")) },
                     modifier = Modifier.weight(1f),
+                    enabled = !importing,
                 ) {
                     Icon(Icons.Default.LibraryMusic, contentDescription = null)
                     Spacer(Modifier.width(6.dp))
@@ -442,6 +523,7 @@ private fun PageSyncScreen(
                 OutlinedButton(
                     onClick = { pagesPicker.launch(arrayOf("image/*")) },
                     modifier = Modifier.weight(1f),
+                    enabled = !importing,
                 ) {
                     Icon(Icons.Default.Image, contentDescription = null)
                     Spacer(Modifier.width(6.dp))
@@ -607,7 +689,7 @@ private fun PageSyncScreen(
                     )
                 }
 
-                if (!exporting && cuePoints.size == pages.size) {
+                if (!exporting && !importing && cuePoints.size == pages.size) {
                     Button(onClick = ::exportVideo, modifier = Modifier.fillMaxWidth()) {
                         Icon(Icons.Default.Save, contentDescription = null)
                         Spacer(Modifier.width(6.dp))
@@ -647,7 +729,7 @@ private fun EmptyPageSyncCard(hasAudio: Boolean, pageCount: Int) {
         ) {
             Text("Manual picture-book timing", style = MaterialTheme.typography.titleLarge)
             Text(
-                "Choose one soundtrack and the ordered page images. Then press Start Manual Sync and tap NEXT PAGE while the narration plays. No waveform required.",
+                "Import a Page Sync project to restore its pages, soundtrack, and cue timing, or choose one soundtrack and the ordered page images manually.",
                 style = MaterialTheme.typography.bodyMedium,
             )
             Text(
