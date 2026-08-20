@@ -48,28 +48,17 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Install Android API and build tools
+      - name: Install Android build tools and accept licenses
         shell: bash
         run: |
-          # Every sdkmanager the runner image provides (and anything it can
-          # "upgrade" to through its own repository metadata) only understands
-          # SDK XML up to v3, while Google's repository now serves the newest
-          # platforms in v4 — so 'platforms;android-37' is invisible to them
-          # and the install exits 1. Use the platform if the image already
-          # ships it; otherwise fetch a pinned modern commandlinetools zip
-          # directly from dl.google.com, bypassing the stale metadata.
-          SDK="${ANDROID_SDK_ROOT:-$ANDROID_HOME}"
-          if [ -d "$SDK/platforms/android-37" ]; then
-            echo "platforms;android-37 already present on the runner image"
-          else
-            curl -fsSL -o /tmp/commandlinetools.zip \
-              https://dl.google.com/android/repository/commandlinetools-linux-13114758_latest.zip
-            unzip -q /tmp/commandlinetools.zip -d /tmp/commandlinetools
-            NEW_SDKMANAGER=/tmp/commandlinetools/cmdline-tools/bin/sdkmanager
-            yes | "$NEW_SDKMANAGER" --sdk_root="$SDK" --licenses >/dev/null || true
-            "$NEW_SDKMANAGER" --sdk_root="$SDK" "platforms;android-37"
-          fi
-          # Old enough to be visible to every sdkmanager; keep strict.
+          # 'platforms;android-37' is not listed in any repository XML the
+          # reachable sdkmanagers can read — the runner image's tools speak
+          # SDK XML v3, and even a downloaded-current commandlinetools build
+          # could not see the package. Do NOT install the platform here:
+          # accept the licenses and install the old-enough packages, then let
+          # AGP's SDK auto-download fetch android-37 during the Gradle build.
+          # AGP bundles a repository parser as new as AGP itself, which is
+          # exactly the component that can resolve the newest platform.
           yes | sdkmanager --licenses >/dev/null || true
           sdkmanager "build-tools;35.0.0" "platform-tools"
 
