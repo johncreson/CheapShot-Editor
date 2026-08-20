@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - release/pagesync-apk
+  pull_request:
+    branches:
+      - master
 
 permissions:
   contents: read
