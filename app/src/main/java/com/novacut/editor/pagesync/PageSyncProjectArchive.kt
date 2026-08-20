@@ -3,11 +3,15 @@ package com.novacut.editor.pagesync
 import android.content.Context
 import android.net.Uri
 import androidx.core.content.FileProvider
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
 import java.security.MessageDigest
+import java.util.Locale
+import java.util.zip.ZipEntry
 import java.util.zip.ZipInputStream
+import java.util.zip.ZipOutputStream
 
 internal const val PAGE_SYNC_PROJECT_MIME = "application/vnd.cheapshot.pagesync+zip"
 internal const val PAGE_SYNC_PROJECT_MANIFEST = "pagesync.json"
@@ -21,20 +25,12 @@ internal data class ImportedPageSyncProject(
 )
 
 /**
- * Portable Page Sync archive reader.
+ * Portable Page Sync archive reader/writer.
  *
- * The archive intentionally stores only the state a narrated still-page book
- * needs: ordered page media, one soundtrack, page-start cues, and canvas
- * metadata. That keeps the format stable and lets external tooling build a
- * project without inventing ClearCut database identifiers.
- *
- * Expected archive shape:
- *
- *   pagesync.json
- *   audio/...
- *   pages/...
- *
- * Optional SHA-256 checksums in the manifest are verified when present.
+ * Version 1 archives contain complete timing for every page. Version 2 also
+ * permits an in-progress session: cues remain a contiguous prefix beginning
+ * at page one, while later sequence entries simply omit cueMs. This makes
+ * Save Project useful during a performance instead of only after it is done.
  */
 internal class PageSyncProjectArchive(private val context: Context) {
 
@@ -58,8 +54,9 @@ internal class PageSyncProjectArchive(private val context: Context) {
             require(manifest.optString("format") == "cheapshot.pagesync") {
                 "This is not a Cheap Shot Page Sync project."
             }
-            require(manifest.optInt("version", 0) == 1) {
-                "Unsupported Page Sync project version ${manifest.optInt("version", 0)}."
+            val version = manifest.optInt("version", 0)
+            require(version == 1 || version == 2) {
+                "Unsupported Page Sync project version $version."
             }
 
             val audioObject = manifest.getJSONObject("audio")
@@ -73,23 +70,37 @@ internal class PageSyncProjectArchive(private val context: Context) {
 
             val pageFiles = ArrayList<File>(sequence.length())
             val cues = ArrayList<Long>(sequence.length())
+            var missingCueSeen = false
             for (index in 0 until sequence.length()) {
                 val item = sequence.getJSONObject(index)
                 val pageFile = safeRelativeFile(projectRoot, item.getString("path"))
                 require(pageFile.isFile) { "Project page ${index + 1} is missing." }
                 pageFiles += pageFile
-                cues += item.getLong("cueMs").coerceAtLeast(0L)
+
+                if (item.has("cueMs")) {
+                    require(!missingCueSeen) {
+                        "Project timing has a gap before page ${index + 1}."
+                    }
+                    cues += item.getLong("cueMs").coerceAtLeast(0L)
+                } else {
+                    require(version >= 2) { "Project timing is incomplete." }
+                    missingCueSeen = true
+                }
             }
 
+            require(cues.isNotEmpty() && cues.first() == 0L) {
+                "The first Page Sync cue must start at zero."
+            }
+            if (version == 1) {
+                require(cues.size == pageFiles.size) { "Project timing is incomplete." }
+            }
             val normalizedCues = PageSyncTimeline.normalized(cues, pageFiles.size)
-            require(normalizedCues.size == pageFiles.size) { "Project timing is incomplete." }
-            require(cues.first() == 0L) { "The first Page Sync cue must start at zero." }
             require(cues == normalizedCues) {
                 "Project cues are not in a valid increasing Page Sync order."
             }
-            if (audioDurationMs > 0L) {
+            if (audioDurationMs > 0L && normalizedCues.isNotEmpty()) {
                 require(normalizedCues.last() < audioDurationMs) {
-                    "The last page starts after the soundtrack ends."
+                    "The last captured page starts after the soundtrack ends."
                 }
             }
 
@@ -111,6 +122,86 @@ internal class PageSyncProjectArchive(private val context: Context) {
         } catch (t: Throwable) {
             projectRoot.deleteRecursively()
             throw t
+        }
+    }
+
+    fun save(
+        destinationUri: Uri,
+        projectName: String,
+        audioUri: Uri,
+        pageUris: List<Uri>,
+        cuePointsMs: List<Long>,
+        audioDurationMs: Long,
+    ) {
+        require(pageUris.isNotEmpty()) { "Project has no pages." }
+        require(pageUris.size <= MAX_PAGE_COUNT) { "Project has too many pages." }
+
+        val safeCues = PageSyncTimeline.normalized(cuePointsMs, pageUris.size)
+        require(safeCues.isNotEmpty() && safeCues.first() == 0L) {
+            "The first Page Sync cue must start at zero."
+        }
+
+        val audioPath = "audio/soundtrack${extensionFor(audioUri, audio = true)}"
+        val pagePaths = pageUris.mapIndexed { index, uri ->
+            "pages/page_${(index + 1).toString().padStart(4, '0')}${extensionFor(uri, audio = false)}"
+        }
+
+        val manifest = JSONObject().apply {
+            put("format", "cheapshot.pagesync")
+            put("version", 2)
+            put("projectName", projectName.ifBlank { "Page Sync Project" })
+            put("canvas", JSONObject().apply {
+                put("width", 1080)
+                put("height", 1920)
+            })
+            put("audio", JSONObject().apply {
+                put("path", audioPath)
+                put("durationMs", audioDurationMs.coerceAtLeast(0L))
+            })
+            put("sequence", JSONArray().apply {
+                pagePaths.forEachIndexed { index, path ->
+                    put(JSONObject().apply {
+                        put("path", path)
+                        if (index < safeCues.size) put("cueMs", safeCues[index])
+                    })
+                }
+            })
+        }
+
+        val output = context.contentResolver.openOutputStream(destinationUri, "w")
+            ?: error("Could not create Page Sync project file.")
+        ZipOutputStream(output.buffered()).use { zip ->
+            writeUriEntry(zip, audioPath, audioUri)
+            pageUris.forEachIndexed { index, uri ->
+                writeUriEntry(zip, pagePaths[index], uri)
+            }
+            zip.putNextEntry(ZipEntry(PAGE_SYNC_PROJECT_MANIFEST))
+            zip.write(manifest.toString(2).toByteArray(Charsets.UTF_8))
+            zip.closeEntry()
+        }
+    }
+
+    private fun writeUriEntry(zip: ZipOutputStream, path: String, uri: Uri) {
+        val input = context.contentResolver.openInputStream(uri)
+            ?: error("Could not read project media: $uri")
+        zip.putNextEntry(ZipEntry(path))
+        input.buffered().use { source -> source.copyTo(zip) }
+        zip.closeEntry()
+    }
+
+    private fun extensionFor(uri: Uri, audio: Boolean): String {
+        return when (context.contentResolver.getType(uri)?.lowercase(Locale.US)) {
+            "image/png" -> ".png"
+            "image/webp" -> ".webp"
+            "image/heic", "image/heif" -> ".heic"
+            "image/gif" -> ".gif"
+            "image/jpeg", "image/jpg" -> ".jpg"
+            "audio/wav", "audio/x-wav" -> ".wav"
+            "audio/mpeg" -> ".mp3"
+            "audio/mp4", "audio/aac", "audio/x-m4a" -> ".m4a"
+            "audio/flac" -> ".flac"
+            "audio/ogg" -> ".ogg"
+            else -> if (audio) ".audio" else ".img"
         }
     }
 
