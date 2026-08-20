@@ -51,8 +51,16 @@ jobs:
       - name: Install Android API and build tools
         shell: bash
         run: |
+          # The setup action's pinned cmdline-tools ships repository metadata
+          # too old to list the newest platform ("Failed to find package
+          # 'platforms;android-37'"). cmdline-tools;latest is always visible
+          # even to stale metadata, so upgrade sdkmanager first and install
+          # the platform through the upgraded one.
           yes | sdkmanager --licenses >/dev/null || true
-          sdkmanager "platforms;android-37" "build-tools;35.0.0" "platform-tools"
+          sdkmanager "cmdline-tools;latest"
+          SDKMANAGER="${ANDROID_SDK_ROOT:-$ANDROID_HOME}/cmdline-tools/latest/bin/sdkmanager"
+          yes | "$SDKMANAGER" --licenses >/dev/null || true
+          "$SDKMANAGER" "platforms;android-37" "build-tools;35.0.0" "platform-tools"
 
       - name: Configure Gradle
         uses: gradle/actions/setup-gradle@v4
