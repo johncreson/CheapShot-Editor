@@ -2,15 +2,20 @@ package com.novacut.editor.pagesync
 
 import android.content.ContentValues
 import android.content.Context
+import android.media.MediaScannerConnection
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
 import com.novacut.editor.engine.FFmpegEngine
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.util.Locale
+import kotlin.coroutines.resume
+
+internal const val PAGE_SYNC_EXPORT_FPS = 30
 
 internal data class PageSyncExportResult(
     val publishedUri: Uri? = null,
@@ -36,8 +41,10 @@ class PageSyncExporter(
         onProgress: (Float) -> Unit = {},
     ): PageSyncExportResult = withContext(Dispatchers.IO) {
         if (pageUris.isEmpty()) return@withContext PageSyncExportResult(error = "No pages selected")
-        val durations = PageSyncTimeline.durations(cuePointsMs, pageUris.size, audioDurationMs)
-        if (durations.size != pageUris.size) {
+        val frames = PageSyncTimeline.frameCounts(
+            cuePointsMs, pageUris.size, audioDurationMs, PAGE_SYNC_EXPORT_FPS,
+        )
+        if (frames.size != pageUris.size) {
             return@withContext PageSyncExportResult(error = "Finish syncing every page before export")
         }
 
@@ -53,9 +60,9 @@ class PageSyncExporter(
             }
 
             val output = File(workDir, "page_sync.mp4")
-            val command = buildCommand(pageFiles, durations, audioFile, output)
+            val command = buildCommand(pageFiles, frames, audioFile, output)
             onProgress(0.03f)
-            val exitCode = ffmpegEngine.execute(command) { engineProgress ->
+            val exitCode = ffmpegEngine.execute(command, progressDurationMs = audioDurationMs) { engineProgress ->
                 onProgress((0.05f + engineProgress.coerceIn(0f, 1f) * 0.88f).coerceIn(0f, 0.93f))
             }
             if (exitCode != 0 || !output.isFile || output.length() <= 0L) {
@@ -76,7 +83,7 @@ class PageSyncExporter(
 
     private fun buildCommand(
         pageFiles: List<File>,
-        durationsMs: List<Long>,
+        framesPerPage: List<Int>,
         audioFile: File,
         output: File,
     ): String {
@@ -85,8 +92,10 @@ class PageSyncExporter(
         pageFiles.forEachIndexed { index, file ->
             args += listOf(
                 "-loop", "1",
-                "-framerate", "30",
-                "-t", seconds(durationsMs[index]),
+                "-framerate", PAGE_SYNC_EXPORT_FPS.toString(),
+                // Generous bound so the looping input terminates; the trim
+                // filter below cuts the segment to its exact frame count.
+                "-t", seconds((framesPerPage[index] + 2) * 1000L / PAGE_SYNC_EXPORT_FPS + 1000L),
                 "-i", file.absolutePath,
             )
         }
@@ -97,7 +106,13 @@ class PageSyncExporter(
             pageFiles.indices.forEach { index ->
                 add(
                     "[$index:v]scale=1080:1920:force_original_aspect_ratio=decrease," +
-                        "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps=30[v$index]"
+                        "pad=1080:1920:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1," +
+                        // Exact per-page frame counts: cue boundaries are
+                        // cumulative-rounded to the fps grid, so per-page
+                        // rounding errors telescope instead of accumulating
+                        // into audibly late page turns.
+                        "fps=$PAGE_SYNC_EXPORT_FPS,trim=end_frame=${framesPerPage[index]}," +
+                        "setpts=PTS-STARTPTS[v$index]"
                 )
             }
             add(pageFiles.indices.joinToString(separator = "") { "[v$it]" } +
@@ -139,7 +154,7 @@ class PageSyncExporter(
             "image/webp" -> ".webp"
             "image/heic", "image/heif" -> ".heic"
             "image/gif" -> ".gif"
-            "image/jpeg" -> ".jpg"
+            "image/jpeg", "image/jpg" -> ".jpg"
             "audio/wav", "audio/x-wav" -> ".wav"
             "audio/mpeg" -> ".mp3"
             "audio/mp4", "audio/aac", "audio/x-m4a" -> ".m4a"
@@ -149,7 +164,7 @@ class PageSyncExporter(
         }
     }
 
-    private fun publishVideo(source: File): PageSyncExportResult {
+    private suspend fun publishVideo(source: File): PageSyncExportResult {
         val name = "CheapShot_PageSync_${System.currentTimeMillis()}.mp4"
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             val values = ContentValues().apply {
@@ -173,11 +188,31 @@ class PageSyncExporter(
                 PageSyncExportResult(error = t.message ?: "Could not publish video")
             }
         } else {
-            val dir = File(context.getExternalFilesDir(Environment.DIRECTORY_MOVIES), "CheapShot")
-            dir.mkdirs()
+            // Pre-Q: the app-private external dir is invisible to gallery apps
+            // and dies with an uninstall. Publish to the public Movies
+            // collection (WRITE_EXTERNAL_STORAGE, maxSdkVersion 28, granted by
+            // the activity before export) and media-scan it so it is indexed.
+            val dir = File(
+                Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MOVIES),
+                "CheapShot",
+            )
+            if (!dir.isDirectory && !dir.mkdirs()) {
+                return PageSyncExportResult(error = "Could not create ${dir.absolutePath}")
+            }
             val destination = File(dir, name)
             source.copyTo(destination, overwrite = true)
-            PageSyncExportResult(file = destination)
+            val scannedUri = scanFile(destination)
+            PageSyncExportResult(publishedUri = scannedUri, file = destination)
+        }
+    }
+
+    private suspend fun scanFile(file: File): Uri? = suspendCancellableCoroutine { continuation ->
+        MediaScannerConnection.scanFile(
+            context,
+            arrayOf(file.absolutePath),
+            arrayOf("video/mp4"),
+        ) { _, uri ->
+            if (continuation.isActive) continuation.resume(uri)
         }
     }
 }

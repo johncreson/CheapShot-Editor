@@ -31,7 +31,15 @@ object PageSyncTimeline {
         return index.coerceIn(0, pageCount - 1)
     }
 
-    /** Records or replaces the start cue for the next page. */
+    /**
+     * Records or replaces the start cue for the next page.
+     *
+     * A capture is only valid when every earlier page already has a cue:
+     * `nextIndex` must land inside the captured list or append exactly at its
+     * end. Jumping ahead (e.g. tapping a later thumbnail mid-performance)
+     * would otherwise append the cue at the wrong page index and silently
+     * corrupt the take, so that case is a no-op.
+     */
     fun captureNextCue(
         cues: List<Long>,
         currentPageIndex: Int,
@@ -42,6 +50,7 @@ object PageSyncTimeline {
         if (pageCount <= 1 || currentPageIndex >= pageCount - 1) return normalized(cues, pageCount)
         val base = normalized(cues, pageCount).toMutableList()
         val nextIndex = currentPageIndex + 1
+        if (nextIndex > base.size) return base
         val previous = base.getOrElse(currentPageIndex) { 0L }
         val upper = if (nextIndex + 1 < base.size) {
             base[nextIndex + 1] - PAGE_SYNC_MIN_GAP_MS
@@ -106,4 +115,41 @@ object PageSyncTimeline {
             (end - start).coerceAtLeast(PAGE_SYNC_MIN_GAP_MS)
         }
     }
+
+    /**
+     * Exact per-page frame counts for a fixed-fps render.
+     *
+     * Each cue is snapped to the fps grid by rounding its *cumulative*
+     * position, and a page's frame count is the difference of adjacent
+     * boundaries. Rounding errors therefore telescope instead of
+     * accumulating: boundary k of the output always sits within half a frame
+     * of the performed cue, no matter how many pages precede it. (Quantizing
+     * each page's duration independently — e.g. per-input `-t` — biases every
+     * page long by up to a frame and drifts the turns audibly late by the end
+     * of a long book.)
+     *
+     * Cues at or beyond the audio end degrade to the 1-frame floor rather
+     * than pushing the video past the soundtrack.
+     */
+    fun frameCounts(cues: List<Long>, pageCount: Int, totalDurationMs: Long, fps: Int): List<Int> {
+        if (pageCount <= 0 || totalDurationMs <= 0L || fps <= 0) return emptyList()
+        val safe = normalized(cues, pageCount)
+        if (safe.size < pageCount) return emptyList()
+        val endBoundary = frameBoundary(totalDurationMs, fps)
+        var previous = 0L
+        return List(pageCount) { index ->
+            val start = previous
+            val end = if (index + 1 < pageCount) {
+                frameBoundary(safe[index + 1], fps).coerceAtMost(endBoundary)
+            } else {
+                endBoundary
+            }
+            val boundedEnd = end.coerceAtLeast(start + 1L)
+            previous = boundedEnd
+            (boundedEnd - start).toInt()
+        }
+    }
+
+    private fun frameBoundary(positionMs: Long, fps: Int): Long =
+        Math.round(positionMs * fps / 1000.0)
 }
