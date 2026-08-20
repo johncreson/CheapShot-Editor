@@ -22,6 +22,7 @@ class FileProviderPathsTest {
             ProviderRoot("files-path", "internal_archives", "archives/"),
             ProviderRoot("files-path", "diagnostic_shares", "diagnostic-shares/"),
             ProviderRoot("files-path", "internal_templates", "templates/"),
+            ProviderRoot("files-path", "page_sync_projects", "page-sync-projects/"),
             ProviderRoot("external-files-path", "exports", "Movies/ClearCut/"),
             ProviderRoot("external-files-path", "external_archives", "archives/"),
             ProviderRoot("external-files-path", "timeline_exports", "exports/"),
@@ -95,6 +96,13 @@ class FileProviderPathsTest {
                 requiredRoots = setOf(
                     ProviderRoot("external-files-path", "templates", "templates/"),
                     ProviderRoot("files-path", "internal_templates", "templates/")
+                )
+            ),
+            ProducerContract(
+                sourcePath = "src/main/java/com/novacut/editor/pagesync/PageSyncProjectArchive.kt",
+                marker = "FileProvider.getUriForFile",
+                requiredRoots = setOf(
+                    ProviderRoot("files-path", "page_sync_projects", "page-sync-projects/")
                 )
             ),
             ProducerContract(
