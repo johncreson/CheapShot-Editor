@@ -6,6 +6,7 @@
     <files-path name="freeze_frames" path="freeze_frames/" />
     <files-path name="internal_exports" path="ClearCut/" />
     <files-path name="internal_archives" path="archives/" />
+    <files-path name="page_sync_projects" path="page-sync-projects/" />
     <files-path name="diagnostic_shares" path="diagnostic-shares/" />
     <files-path name="internal_templates" path="templates/" />
     <external-files-path name="exports" path="Movies/ClearCut/" />

@@ -29,7 +29,7 @@ internal data class PageSyncExportResult(
  * FFmpeg engine to concatenate the stills at the performed cue durations, and
  * publishes the MP4 to Movies/CheapShot.
  */
-class PageSyncExporter(
+internal class PageSyncExporter(
     private val context: Context,
     private val ffmpegEngine: FFmpegEngine,
 ) {

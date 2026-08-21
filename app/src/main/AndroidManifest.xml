@@ -196,6 +196,30 @@
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
+            <!-- Preferred handler when a source app supplies the Cheap Shot
+                 Page Sync MIME type. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data
+                    android:scheme="content"
+                    android:mimeType="application/vnd.cheapshot.pagesync+zip" />
+            </intent-filter>
+            <!-- Downloads/file providers often report an unknown project
+                 extension as ZIP or octet-stream. Exposing those two here
+                 makes Page Sync available in Android's Open With chooser;
+                 the importer still validates the internal manifest before
+                 accepting the file. -->
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data
+                    android:scheme="content"
+                    android:mimeType="application/zip" />
+                <data
+                    android:scheme="content"
+                    android:mimeType="application/octet-stream" />
+            </intent-filter>
         </activity>
 
         <service
